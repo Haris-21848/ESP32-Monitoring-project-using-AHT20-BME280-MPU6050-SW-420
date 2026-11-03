@@ -1,0 +1,432 @@
+/*
+ * MQTT SENSOR NODE + OLED SUBSCRIBER - ESP32 (single board)
+ * Publishers : AHT20, BMP280, MPU6500 (I2C) and SW-420 (GPIO27), sent by the ESP32
+ * Subscribers: MQTTX on the desktop AND the OLED on this same ESP32
+ * Event-driven: a message is sent only when a value changes or something happens
+ */
+
+
+#include <math.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <MPU6500_WE.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
+const char* ssid        = "";
+const char* password    = "";
+const char* mqtt_server = "";      // Linode public IP
+const int   mqtt_port   = 1883;
+const char* mqtt_user   = "";
+const char* mqtt_pass   = "";
+const char* device_id   = "ESP32_";   // must be unique on the broker
+
+
+const char* topic_aht       = "esp32/unit01/aht20";
+const char* topic_bmp       = "esp32/unit01/bme280";
+const char* topic_imu       = "esp32/unit01/mpu6050";
+const char* topic_vibration = "esp32/unit01/vibration";
+const char* topic_status = "esp32/unit01/status";
+
+#define VIB_PIN 27
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define SCREEN_W  128
+#define SCREEN_H  64
+#define OLED_ADDR 0x3C
+
+#define DEBUG_PRINT 1     // 0 = quiet Serial Monitor
+
+// ---- When should something be sent? (tune these) ----
+const unsigned long ENV_SAMPLE_MS = 2000;    // how often AHT20/BMP280 are CHECKED (not sent)
+const unsigned long IMU_SAMPLE_MS = 100;     // how often the MPU6500 is CHECKED
+
+const float DEAD_TEMP  = 0.5;                // send if temp changed by this much (C)
+const float DEAD_HUM   = 2.0;                // ... humidity (%RH)
+const float DEAD_PRESS = 0.5;                // ... pressure (hPa)
+const unsigned long HEARTBEAT_MS = 60000;    // resend environment values at least this often (0 = never)
+
+const float MOTION_ACCEL_DELTA = 1.5;        // m/s^2 away from gravity (9.81) counts as motion
+const float MOTION_GYRO        = 1;        // rad/s of rotation counts as motion
+const unsigned long MOTION_UPDATE_MS = 500;  // max one motion message per 0.5 s while moving
+const unsigned long MOTION_CALM_MS   = 2000; // quiet time before "active:false"
+
+//const unsigned long VIB_PUBLISH_GAP = 200;  // max one vibration message per second
+const unsigned long VIB_CALM_MS     = 3000;  // quiet time before "active:false"
+
+// ==========================================
+// 2. GLOBALS
+// ==========================================
+WiFiClient espClient;
+PubSubClient client(espClient);
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1, 100000UL, 100000UL);
+
+Adafruit_AHTX0   aht;
+Adafruit_BMP280  bmp;
+MPU6500_WE mpu(0x68);
+bool ahtOk = false, bmpOk = false, mpuOk = false, oledOk = false;
+
+// --- publisher state (what we last sent) ---
+float pAhtT = NAN, pAhtH = NAN, pBmpT = NAN, pBmpP = NAN;
+unsigned long lastAhtPub = 0, lastBmpPub = 0;
+unsigned long lastEnvSample = 0, lastImuSample = 0;
+
+bool motionActive = false;
+bool imuReported = false;
+unsigned long lastMotionSeen = 0, lastMotionPub = 0;
+
+portMUX_TYPE vibMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t      vibCount   = 0;
+volatile unsigned long lastVibIsr = 0;
+volatile bool          vibFlag    = false;
+bool vibActive = false;
+unsigned long lastVibPub = 0;
+
+// --- subscriber state (what the OLED shows, filled from broker messages) ---
+float dAhtT = NAN, dAhtH = NAN, dBmpT = NAN, dBmpP = NAN;
+bool dMotion = false, dVib = false;
+uint32_t dVibCount = 0;
+bool needRedraw = true;
+unsigned long lastDraw = 0;
+
+// ==========================================
+// 3. HELPERS
+// ==========================================
+float rnd(float v, int d = 1) {
+  float m = powf(10.0f, d);
+  return roundf(v * m) / m;
+}
+
+// true if the new value differs enough from what we last sent
+bool changed(float prev, float cur, float dead) {
+  if (isnan(cur)) return false;
+  return isnan(prev) || fabsf(cur - prev) >= dead;
+}
+
+bool publishDoc(const char* topic, JsonDocument& doc, bool retain = false) {
+  char buf[384];
+  if (measureJson(doc) >= sizeof(buf)) {
+    Serial.println("Publish failed: JSON too large");
+    return false;
+  }
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  bool ok = client.publish(topic, (const uint8_t*)buf, n, retain);
+#if DEBUG_PRINT
+  Serial.printf("%s %s %s\n", ok ? "->" : "SEND FAILED:", topic, buf);
+#endif
+  return ok;
+}
+
+// Vibration interrupt: keep it tiny, no Serial or MQTT inside
+void IRAM_ATTR onVibration() {
+  unsigned long t = millis();
+  portENTER_CRITICAL_ISR(&vibMux);
+  if (t - lastVibIsr > 50) {           // 50 ms debounce
+    vibCount++;
+    vibFlag = true;
+    lastVibIsr = t;
+  }
+  portEXIT_CRITICAL_ISR(&vibMux);
+}
+
+// ==========================================
+// 4. OLED (shows what came back from the broker)
+// ==========================================
+void printVal(float v, int dec) {
+  if (isnan(v)) display.print("--");
+  else display.print(v, dec);
+}
+
+void drawDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print((WiFi.status() == WL_CONNECTED && client.connected()) ? "Sensor node [MQTT OK]" : "Sensor node [offline]");
+  display.drawFastHLine(0, 10, SCREEN_W, SSD1306_WHITE);
+
+  display.setCursor(0, 14);
+  display.print("AHT  "); printVal(dAhtT, 1); display.print("C  ");
+  printVal(dAhtH, 0); display.print("%");
+
+  display.setCursor(0, 24);
+  display.print("BMP  "); printVal(dBmpT, 1); display.print("C");
+
+  display.setCursor(0, 34);
+  display.print("Press "); printVal(dBmpP, 1); display.print(" hPa");
+
+  display.setCursor(0, 44);
+  display.print("Motion: ");
+  display.print(dMotion ? "MOVING" : "still");
+
+  if (dVib) {                                       // alert banner
+    display.fillRect(0, 53, SCREEN_W, 11, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(2, 55);
+    display.print("VIBRATION SENSED!");
+  } else {
+    display.setCursor(0, 54);
+    display.print("Vibration: none #");
+    display.print(dVibCount);
+  }
+  display.display();
+}
+
+// ==========================================
+// 5. CALLBACK (subscriber side: messages from the broker)
+// ==========================================
+void callback(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length)) return;   // ignore bad JSON
+
+#if DEBUG_PRINT
+  Serial.printf("<- %s (received from broker)\n", topic);
+#endif
+
+  String t = topic;
+  if (t == topic_aht) {
+    dAhtT = doc["temp"]     | NAN;
+    dAhtH = doc["humidity"] | NAN;
+  } else if (t == topic_bmp) {
+    dBmpT = doc["temp"]     | NAN;
+    dBmpP = doc["pressure"] | NAN;
+  } else if (t == topic_imu) {
+    dMotion = doc["active"] | false;
+  } else if (t == topic_vibration) {
+    dVib      = doc["active"] | false;
+    dVibCount = doc["count"]  | 0U;
+  }
+  needRedraw = true;
+}
+
+// ==========================================
+// 6. WIFI + MQTT CONNECTION
+// ==========================================
+void setup_wifi() {
+  Serial.printf("\nConnecting to WiFi: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nWiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnect() {
+  if (oledOk) drawDisplay();                        // shows [offline]
+  while (!client.connected() && WiFi.status() == WL_CONNECTED) {
+    Serial.print("Attempting MQTT connection...");
+  if (client.connect(device_id, mqtt_user, mqtt_pass,
+                   topic_status, 1, true, "offline")) {   // last will: QoS 1, retained
+  Serial.println("connected");
+  client.publish(topic_status, "online", true);           // retained "I'm alive"
+  client.subscribe(topic_aht);
+  client.subscribe(topic_bmp);
+  client.subscribe(topic_imu);
+  client.subscribe(topic_vibration);
+  // Force fresh readings after reconnection, even if values are unchanged.
+  pAhtT = pAhtH = pBmpT = pBmpP = NAN;
+  imuReported = false;
+  needRedraw = true;
+}else {
+      Serial.printf("failed, rc=%d, retry in 5 s\n", client.state());
+      delay(5000);
+    }
+  }
+}
+
+// ==========================================
+// 7. PUBLISHER SIDE (send only when needed)
+// ==========================================
+void checkEnvironment(unsigned long now) {
+  if (ahtOk) {
+    sensors_event_t hum, temp;
+    aht.getEvent(&hum, &temp);
+    float t = temp.temperature, h = hum.relative_humidity;
+    bool due = HEARTBEAT_MS > 0 && (now - lastAhtPub >= HEARTBEAT_MS);
+    if (!isnan(t) && !isnan(h) &&
+        (due || changed(pAhtT, t, DEAD_TEMP) || changed(pAhtH, h, DEAD_HUM))) {
+      JsonDocument d;
+      d["temp"]     = rnd(t);
+      d["humidity"] = rnd(h);
+      if (publishDoc(topic_aht, d, true)) {
+        pAhtT = t; pAhtH = h; lastAhtPub = now;
+      }
+    }
+  }
+  if (bmpOk) {
+    float t = bmp.readTemperature();
+    float p = bmp.readPressure() / 100.0f;          // hPa
+    bool due = HEARTBEAT_MS > 0 && (now - lastBmpPub >= HEARTBEAT_MS);
+    if (!isnan(t) && !isnan(p) &&
+        (due || changed(pBmpT, t, DEAD_TEMP) ||
+         changed(pBmpP, p, DEAD_PRESS))) {
+      JsonDocument d;
+      d["temp"]     = rnd(t);
+      d["pressure"] = rnd(p);
+      if (publishDoc(topic_bmp, d, true)) {
+        pBmpT = t; pBmpP = p; lastBmpPub = now;
+      }
+    }
+  }
+}
+
+void checkMotion(unsigned long now) {
+  if (!mpuOk) return;
+
+  // MPU9250_WE returns acceleration in g and gyro rates in degrees/s.
+  xyzFloat a = mpu.getGValues();
+  xyzFloat g = mpu.getGyrValues();
+  const float gravity = 9.80665f;
+  const float degToRad = 0.01745329252f;
+  float ax = a.x * gravity, ay = a.y * gravity, az = a.z * gravity;
+  float gx = g.x * degToRad, gy = g.y * degToRad, gz = g.z * degToRad;
+  if (!isfinite(ax) || !isfinite(ay) || !isfinite(az) ||
+      !isfinite(gx) || !isfinite(gy) || !isfinite(gz)) return;
+
+  float accMag = sqrtf(ax * ax + ay * ay + az * az);
+  float gyroMag = sqrtf(gx * gx + gy * gy + gz * gz);
+  bool moving = fabsf(accMag - gravity) > MOTION_ACCEL_DELTA ||
+                gyroMag > MOTION_GYRO;
+  if (moving) lastMotionSeen = now;
+  bool active = moving || (motionActive && now - lastMotionSeen < MOTION_CALM_MS);
+  bool heartbeat = HEARTBEAT_MS > 0 && now - lastMotionPub >= HEARTBEAT_MS;
+  bool due = !imuReported || active != motionActive || heartbeat ||
+             (active && now - lastMotionPub >= MOTION_UPDATE_MS);
+  if (!due) return;
+
+  JsonDocument d;
+  d["active"] = active;
+  d["mag"] = rnd(accMag, 2);
+  d["ax"] = rnd(ax, 2); d["ay"] = rnd(ay, 2); d["az"] = rnd(az, 2);
+  d["gx"] = rnd(gx, 2); d["gy"] = rnd(gy, 2); d["gz"] = rnd(gz, 2);
+  if (publishDoc(topic_imu, d)) {
+    motionActive = active;
+    imuReported = true;
+    lastMotionPub = now;
+  }
+}
+
+void handleVibration(unsigned long now) {
+  portENTER_CRITICAL(&vibMux);
+  bool pending = vibFlag;
+  uint32_t count = vibCount;
+  unsigned long lastSeen = lastVibIsr;
+  vibFlag = false;
+  portEXIT_CRITICAL(&vibMux);
+
+  now = millis();
+
+  // Send ON only once when a vibration episode starts.
+  if (pending && !vibActive) {
+    JsonDocument d;
+    d["active"] = true;
+    d["count"] = count;
+
+    if (publishDoc(topic_vibration, d)) {
+      vibActive = true;
+    } else {
+      // Retry if sending failed.
+      portENTER_CRITICAL(&vibMux);
+      vibFlag = true;
+      portEXIT_CRITICAL(&vibMux);
+    }
+  }
+
+  // Send OFF after 3 seconds without any vibration trigger.
+  if (vibActive && !pending &&
+      now - lastSeen >= VIB_CALM_MS) {
+    JsonDocument d;
+    d["active"] = false;
+    d["count"] = count;
+
+    if (publishDoc(topic_vibration, d)) {
+      vibActive = false;
+    }
+  }
+}
+// ==========================================
+// 8. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(VIB_PIN, INPUT);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);               // same bus speed as the working scanner
+  delay(200);
+
+  ahtOk  = aht.begin();
+  bmpOk  = bmp.begin(0x76);            // BMP280, chip ID = 0x58
+  mpuOk  = mpu.init();                // MPU6500 at 0x68, WHO_AM_I = 0x70
+  oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  Serial.printf("AHT20:%d BMP280:%d MPU6500:%d OLED:%d\n", ahtOk, bmpOk, mpuOk, oledOk);
+
+  if (mpuOk) {
+    // No autoOffsets(): that requires a specific flat calibration position.
+    mpu.setAccRange(MPU6500_ACC_RANGE_8G);
+    mpu.setGyrRange(MPU6500_GYRO_RANGE_500);
+    mpu.enableGyrDLPF();
+    mpu.setGyrDLPF(MPU6500_DLPF_4);
+    mpu.enableAccDLPF(true);
+    mpu.setAccDLPF(MPU6500_DLPF_4);
+    mpu.setSampleRateDivider(9);
+    delay(200);
+  }
+
+  if (oledOk) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Starting...");
+    display.display();
+  }
+
+  Wire.setClock(100000);
+
+  attachInterrupt(digitalPinToInterrupt(VIB_PIN), onVibration, RISING);
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  client.setBufferSize(512);
+}
+
+// ==========================================
+// 9. LOOP
+// ==========================================
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {   // auto-reconnect is on
+    if (oledOk) drawDisplay();
+    delay(500);
+    return;
+  }
+  if (!client.connected()) reconnect();
+  if (!client.connected()) return;
+  client.loop();                          // delivers incoming messages to callback()
+
+  unsigned long now = millis();
+  if (now - lastEnvSample >= ENV_SAMPLE_MS) { lastEnvSample = now; checkEnvironment(now); }
+  if (now - lastImuSample >= IMU_SAMPLE_MS) { lastImuSample = now; checkMotion(now); }
+  handleVibration(now);
+
+  if (oledOk && (needRedraw || now - lastDraw >= 1000) && now - lastDraw >= 100) {
+    lastDraw = now;
+    needRedraw = false;
+    drawDisplay();
+  }
+}
