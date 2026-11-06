@@ -4,3 +4,7 @@ Built an ESP32 monitoring system to collect temperature, humidity, pressure, mot
 # Flow Chart
 
 <img width="2720" height="1264" alt="sensor_to_mqttx_and_oled_flow" src="https://github.com/user-attachments/assets/55800a68-96f8-4fc3-8a6e-b159d73b74ec" />
+
+# Wiring
+
+<img width="838" height="651" alt="image" src="https://github.com/user-attachments/assets/917c1fc5-5611-4a59-8713-10a862cad48f" />
